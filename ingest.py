@@ -177,6 +177,56 @@ def chunk_all_documents(documents: List[Dict]) -> List[Dict]:
         print(f"  ✓ {doc['filename']:60s} → {len(chunks):4d} chunks")
     
     return all_chunks
+
+
+# ───────────────────────────────────────────────────────────────
+# Stage 3: Embed chunks via OpenAI
+# ───────────────────────────────────────────────────────────────
+
+def embed_chunks(
+    chunks: List[Dict],
+    batch_size: int = 100,
+) -> List[Dict]:
+    """
+    Generate embeddings for every chunk, attach the vectors to the chunk dicts.
+    
+    Why batch?
+        Each API call has overhead. Sending 100 texts in one call is much
+        faster than 100 separate calls. OpenAI accepts up to 2048 inputs
+        per request — we cap at 100 for safety + better progress visibility.
+    
+    Why the same model used at query time?
+        Embeddings only make sense within the model that produced them.
+        Different models = different vector spaces = meaningless similarity.
+    """
+    if not chunks:
+        return chunks
+    
+    print(f"\nEmbedding {len(chunks)} chunks via {EMBEDDING_MODEL}...")
+    print(f"  Batch size: {batch_size}")
+    
+    total_batches = (len(chunks) + batch_size - 1) // batch_size  # ceiling division
+    
+    for batch_num, start in enumerate(range(0, len(chunks), batch_size), 1):
+        batch = chunks[start:start + batch_size]
+        texts = [c["text"] for c in batch]
+        
+        try:
+            response = openai_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=texts,
+            )
+        except Exception as e:
+            print(f"  ✗ Batch {batch_num}/{total_batches} failed: {e}")
+            raise  # Halt — we don't want a partially embedded DB
+        
+        # Attach embeddings back to the original chunk dicts
+        for chunk, embedding_data in zip(batch, response.data):
+            chunk["embedding"] = embedding_data.embedding
+        
+        print(f"  ✓ Batch {batch_num}/{total_batches}  ({len(batch)} chunks embedded)")
+    
+    return chunks
 # ───────────────────────────────────────────────────────────────
 # Main execution
 # ───────────────────────────────────────────────────────────────
@@ -191,11 +241,9 @@ if __name__ == "__main__":
     
     # Stage 1: Load PDFs
     documents = load_all_pdfs(DOCS_DIR)
-    
     if not documents:
         print("\nNo documents loaded. Add PDFs to docs/ and try again.")
         exit(1)
-    
     total_chars = sum(d["char_count"] for d in documents)
     print(f"\n✓ Loaded {len(documents)} documents, {total_chars:,} total characters")
     
@@ -204,3 +252,14 @@ if __name__ == "__main__":
     total_tokens = sum(c["token_count"] for c in chunks)
     print(f"\n✓ Created {len(chunks)} chunks, {total_tokens:,} total tokens")
     print(f"  Estimated embedding cost: ${total_tokens * 0.02 / 1_000_000:.4f}")
+    
+    # Stage 3: Embed
+    chunks = embed_chunks(chunks)
+    
+    # Sanity check — confirm every chunk has an embedding of the right size
+    sample = chunks[0]
+    assert "embedding" in sample, "First chunk missing embedding!"
+    assert len(sample["embedding"]) == EMBEDDING_DIM, (
+        f"Wrong embedding dim: {len(sample['embedding'])} (expected {EMBEDDING_DIM})"
+    )
+    print(f"\n✓ All {len(chunks)} chunks embedded ({EMBEDDING_DIM} dims each)")
