@@ -227,6 +227,68 @@ def embed_chunks(
         print(f"  ✓ Batch {batch_num}/{total_batches}  ({len(batch)} chunks embedded)")
     
     return chunks
+
+# ───────────────────────────────────────────────────────────────
+# Stage 4: Store chunks in ChromaDB
+# ───────────────────────────────────────────────────────────────
+
+def store_chunks(chunks: List[Dict]) -> None:
+    """
+    Persist chunks + embeddings + metadata into ChromaDB.
+    
+    ChromaDB stores 4 things per item:
+        - id:         unique identifier (we use chunk_id)
+        - embedding:  the 1536-dim vector
+        - document:   the chunk text (so we can retrieve the actual content later)
+        - metadata:   dict of additional fields for filtering / display
+    
+    Note on idempotency:
+        We delete the collection first if it exists. This makes re-running
+        the script safe and predictable — no duplicate chunks if you
+        re-ingest. Production systems would use upserts instead.
+    """
+    if not chunks:
+        print("No chunks to store.")
+        return
+    
+    print(f"\nStoring {len(chunks)} chunks in ChromaDB collection '{COLLECTION_NAME}'...")
+    
+    # Drop the collection if it exists (idempotent re-runs)
+    try:
+        chroma_client.delete_collection(COLLECTION_NAME)
+        print(f"  ↻ Dropped existing collection (re-ingest)")
+    except Exception:
+        pass  # Collection didn't exist, fine
+    
+    # Create fresh collection
+    collection = chroma_client.create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},  # Use cosine similarity (standard for embeddings)
+    )
+    
+    # Build the four parallel lists Chroma expects
+    ids = [c["chunk_id"] for c in chunks]
+    embeddings = [c["embedding"] for c in chunks]
+    documents = [c["text"] for c in chunks]
+    metadatas = [
+        {
+            "source": c["source"],
+            "chunk_index": c["chunk_index"],
+            "token_count": c["token_count"],
+        }
+        for c in chunks
+    ]
+    
+    # Insert (Chroma also accepts batched inserts; for our size this is fine in one call)
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=metadatas,
+    )
+    
+    print(f"  ✓ Stored {collection.count()} chunks")
+    print(f"  ✓ Persisted to {DB_DIR.resolve()}")
 # ───────────────────────────────────────────────────────────────
 # Main execution
 # ───────────────────────────────────────────────────────────────
@@ -255,11 +317,14 @@ if __name__ == "__main__":
     
     # Stage 3: Embed
     chunks = embed_chunks(chunks)
-    
-    # Sanity check — confirm every chunk has an embedding of the right size
     sample = chunks[0]
-    assert "embedding" in sample, "First chunk missing embedding!"
-    assert len(sample["embedding"]) == EMBEDDING_DIM, (
-        f"Wrong embedding dim: {len(sample['embedding'])} (expected {EMBEDDING_DIM})"
-    )
+    assert "embedding" in sample
+    assert len(sample["embedding"]) == EMBEDDING_DIM
     print(f"\n✓ All {len(chunks)} chunks embedded ({EMBEDDING_DIM} dims each)")
+    
+    # Stage 4: Store
+    store_chunks(chunks)
+    
+    print(f"\n{'='*60}")
+    print(f"✓ Ingestion complete. {len(chunks)} chunks ready for retrieval.")
+    print(f"{'='*60}\n")
